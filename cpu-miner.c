@@ -1,6 +1,6 @@
 /*
  * Copyright 2010 Jeff Garzik
- * Copyright 2012-2015 pooler
+ * Copyright 2012-2014 pooler
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -274,7 +274,7 @@ static time_t g_work_time;
 static pthread_mutex_t g_work_lock;
 static bool submit_old = false;
 static char *lp_id;
-
+static uint32_t main_target[8];
 static inline void work_free(struct work *w)
 {
 	free(w->txs);
@@ -282,6 +282,39 @@ static inline void work_free(struct work *w)
 	free(w->job_id);
 	free(w->xnonce2);
 }
+
+
+static void print_block_network_diff(struct stratum_job *job) {
+	uint8_t pow = job->nbits[0];
+	int powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
+	uint32_t diff32 = be32toh(*((uint32_t *)job->nbits)) & 0x00FFFFFF;
+	double numerator = 0xFFFFULL << powdiff;
+	double ddiff = numerator / (double)diff32;
+	diff_to_target(main_target, ddiff);
+	// applog(LOG_INFO, "Stratum detected new block, diff: %0.2f", ddiff);
+	char target_str[65];
+	uint32_t target_be[8];
+	int i;
+	for (i = 0; i < 8; i++)
+		be32enc(target_be + i, main_target[7 - i]);
+	bin2hex(target_str, (unsigned char *)target_be, 32);
+	applog(LOG_DEBUG, "DEBUG: Main Target: %s", target_str);
+}
+
+
+// static void compute_main_target(uint32_t) {
+// 	uint8_t pow = job->nbits[0];
+// 	int powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
+// 	uint32_t diff32 = be32toh(*((uint32_t *)job->nbits)) & 0x00FFFFFF;
+// 	double numerator = 0xFFFFULL << powdiff;
+// 	double ddiff = numerator / (double)diff32;
+// 	diff_to_target(main_target, ddiff);
+// 	applog(LOG_INFO, "Stratum detected new block, diff: %0.2f", ddiff);
+// 	char target_str[65];
+// 	bin2hex(target_str, (unsigned char *)main_target, 32);
+// 	applog(LOG_DEBUG, "DEBUG: Target: %s", target_str);
+// }
+
 
 static inline void work_copy(struct work *dest, const struct work *src)
 {
@@ -344,9 +377,6 @@ err_out:
 	return false;
 }
 
-#define BLOCK_VERSION_MASK 0x000000ff
-#define BLOCK_VERSION_CURRENT 4
-
 static bool gbt_work_decode(const json_t *val, struct work *work)
 {
 	int i, n;
@@ -396,11 +426,12 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		goto out;
 	}
 	version = json_integer_value(tmp);
-	if ((version & BLOCK_VERSION_MASK) > BLOCK_VERSION_CURRENT) {
+	if (version > 2) {
 		if (version_reduce) {
-			version = (version & ~BLOCK_VERSION_MASK) | BLOCK_VERSION_CURRENT;
+			version = 2;
 		} else if (!version_force) {
-			applog(LOG_WARNING, "Unrecognized block version: %u", version);
+			applog(LOG_ERR, "Unrecognized block version: %u", version);
+			goto out;
 		}
 	}
 
@@ -554,7 +585,6 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 			goto out;
 		}
 		sha256d(merkle_tree[1 + i], tx, tx_size);
-		free(tx);
 		if (!submit_coinbase)
 			strcat(work->txs, tx_hex);
 	}
@@ -585,9 +615,10 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		applog(LOG_ERR, "JSON invalid target");
 		goto out;
 	}
-	for (i = 0; i < ARRAY_SIZE(work->target); i++)
-		work->target[7 - i] = be32dec(target + i);
 
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);	
+		
 	tmp = json_object_get(val, "workid");
 	if (tmp) {
 		if (!json_is_string(tmp)) {
@@ -605,7 +636,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		if (!have_longpoll) {
 			char *lp_uri;
 			tmp = json_object_get(val, "longpolluri");
-			lp_uri = strdup(json_is_string(tmp) ? json_string_value(tmp) : rpc_url);
+			lp_uri = json_is_string(tmp) ? strdup(json_string_value(tmp)) : rpc_url;
 			have_longpoll = true;
 			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
 		}
@@ -646,6 +677,14 @@ static void share_result(int result, const char *reason)
 
 static bool submit_upstream_work(CURL *curl, struct work *work)
 {
+	// FILE *pf;
+	// char command[1000];
+	// char difficulty[100];
+	// sprintf(command, "bitcoin-cli -datadir=/home/inian/bitcoin/experiment getdifficulty");
+	// pf = popen(command, "r");
+	// fgets(difficulty, 50 , pf);
+	// pclose(pf);
+	// applog(LOG_DEBUG, "diff is %s", difficulty);
 	json_t *val, *res, *reason;
 	char data_str[2 * sizeof(work->data) + 1];
 	char s[345];
@@ -661,22 +700,19 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 	if (have_stratum) {
 		uint32_t ntime, nonce;
-		char ntimestr[9], noncestr[9], *xnonce2str, *req;
+		char ntimestr[9], noncestr[9], *xnonce2str;
 
 		le32enc(&ntime, work->data[17]);
 		le32enc(&nonce, work->data[19]);
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		req = malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
-		sprintf(req,
+		sprintf(s,
 			"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
 			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
 		free(xnonce2str);
 
-		rc = stratum_send_line(&stratum, req);
-		free(req);
-		if (unlikely(!rc)) {
+		if (unlikely(!stratum_send_line(&stratum, s))) {
 			applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
 			goto out;
 		}
@@ -1042,6 +1078,9 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 	work->data[17] = le32dec(sctx->job.ntime);
 	work->data[18] = le32dec(sctx->job.nbits);
+	applog(LOG_DEBUG, "DEBUG: nbits=%08x",
+		       swab32(work->data[18]));
+
 	work->data[20] = 0x80000000;
 	work->data[31] = 0x00000280;
 
@@ -1052,7 +1091,7 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s ntime=%08x",
 		       work->job_id, xnonce2str, swab32(work->data[17]));
 		free(xnonce2str);
-	}
+	}	
 
 	if (opt_algo == ALGO_SCRYPT)
 		diff_to_target(work->target, sctx->job.diff / 65536.0);
@@ -1116,7 +1155,6 @@ static void *miner_thread(void *userdata)
 			if (!have_stratum &&
 			    (time(NULL) - g_work_time >= min_scantime ||
 			     work.data[19] >= end_nonce)) {
-				work_free(&g_work);
 				if (unlikely(!get_work(mythr, &g_work))) {
 					applog(LOG_ERR, "work retrieval failed, exiting "
 						"mining thread %d", mythr->id);
@@ -1173,7 +1211,7 @@ static void *miner_thread(void *userdata)
 
 		case ALGO_SHA256D:
 			rc = scanhash_sha256d(thr_id, work.data, work.target,
-			                      max_nonce, &hashes_done);
+			                      max_nonce, &hashes_done, main_target);
 			break;
 
 		default:
@@ -1289,7 +1327,6 @@ start:
 			soval = json_object_get(res, "submitold");
 			submit_old = soval ? json_is_true(soval) : false;
 			pthread_mutex_lock(&g_work_lock);
-			work_free(&g_work);
 			if (have_gbt)
 				rc = gbt_work_decode(res, &g_work);
 			else
@@ -1395,10 +1432,12 @@ static void *stratum_thread(void *userdata)
 		    (!g_work_time || strcmp(stratum.job.job_id, g_work.job_id))) {
 			pthread_mutex_lock(&g_work_lock);
 			stratum_gen_work(&stratum, &g_work);
+			print_block_network_diff(&stratum.job);
 			time(&g_work_time);
 			pthread_mutex_unlock(&g_work_lock);
 			if (stratum.job.clean) {
 				applog(LOG_INFO, "Stratum requested work restart");
+				// print_block_network_diff(&stratum.job);
 				restart_threads();
 			}
 		}
@@ -1430,7 +1469,6 @@ static void show_version_and_exit(void)
 #endif
 #if defined(USE_ASM) && defined(__x86_64__)
 		" x86_64"
-		" PHE"
 #endif
 #if defined(USE_ASM) && (defined(__i386__) || defined(__x86_64__))
 		" SSE2"
@@ -1458,12 +1496,6 @@ static void show_version_and_exit(void)
 #endif
 #if defined(__ARM_NEON__)
 		" NEON"
-#endif
-#endif
-#if defined(USE_ASM) && (defined(__powerpc__) || defined(__ppc__) || defined(__PPC__))
-		" PowerPC"
-#if defined(__ALTIVEC__)
-		" AltiVec"
 #endif
 #endif
 		"\n");
@@ -1620,8 +1652,7 @@ static void parse_arg(int key, char *arg, char *pname)
 		if (ap != arg) {
 			if (strncasecmp(arg, "http://", 7) &&
 			    strncasecmp(arg, "https://", 8) &&
-			    strncasecmp(arg, "stratum+tcp://", 14) &&
-			    strncasecmp(arg, "stratum+tcps://", 15)) {
+			    strncasecmp(arg, "stratum+tcp://", 14)) {
 				fprintf(stderr, "%s: unknown protocol -- '%s'\n",
 					pname, arg);
 				show_usage_and_exit(1);
@@ -1832,8 +1863,7 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&stratum.sock_lock, NULL);
 	pthread_mutex_init(&stratum.work_lock, NULL);
 
-	flags = opt_benchmark || (strncasecmp(rpc_url, "https://", 8) &&
-	                          strncasecmp(rpc_url, "stratum+tcps://", 15))
+	flags = !opt_benchmark && strncmp(rpc_url, "https:", 6)
 	      ? (CURL_GLOBAL_ALL & ~CURL_GLOBAL_SSL)
 	      : CURL_GLOBAL_ALL;
 	if (curl_global_init(flags)) {
